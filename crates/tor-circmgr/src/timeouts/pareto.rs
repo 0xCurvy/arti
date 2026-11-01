@@ -557,8 +557,15 @@ impl ParetoTimeoutEstimator {
 
 impl super::TimeoutEstimator for ParetoTimeoutEstimator {
     fn update_params(&mut self, p: &NetParameters) {
-        let parameters = p.into();
+        let parameters: Params = p.into();
+        // The fallback follows `cbtinitialtimeout` until timeouts have doubled it; a doubled
+        // fallback is kept.
+        if self.fallback_timeouts == self.p.default_thresholds {
+            self.fallback_timeouts = parameters.default_thresholds;
+        }
         self.p = parameters;
+        // A cached estimate was made with the old parameters (`cbtmintimeout`, the quantiles).
+        self.timeouts.take();
         let new_success_len = self.p.success_history_len;
         self.history.set_success_history_len(new_success_len);
     }
@@ -990,6 +997,53 @@ mod test {
             est.note_circ_timeout(2, Duration::from_secs(2000));
         }
         assert_eq!(est.timeouts(&b3()).0.as_micros(), 120_000_000);
+    }
+
+    #[test]
+    fn initial_timeout_follows_params() {
+        let mut est = ParetoTimeoutEstimator::default();
+        let params = NetParameters::from_map(&"cbtinitialtimeout=10000".parse().unwrap());
+        est.update_params(&params);
+        assert_eq!(
+            est.timeouts(&b3()),
+            (Duration::from_secs(10), Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn doubled_fallback_survives_new_params() {
+        let mut est = ParetoTimeoutEstimator::default();
+        let params = NetParameters::from_map(&"cbtinitialtimeout=10000".parse().unwrap());
+        est.update_params(&params);
+
+        // More than 18 timeouts in the last 20 attempts double the fallback.
+        for _ in 0..20 {
+            est.note_circ_timeout(2, Duration::from_secs(2000));
+        }
+        assert_eq!(est.timeouts(&b3()).0, Duration::from_secs(20));
+
+        // The next consensus does not undo the doubling.
+        est.update_params(&params);
+        assert_eq!(est.timeouts(&b3()).0, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn new_params_replace_a_cached_estimate() {
+        let mut est = ParetoTimeoutEstimator::default();
+        let params = NetParameters::from_map(&"cbtmincircs=1 cbtnummodes=2".parse().unwrap());
+        est.update_params(&params);
+        for msec in &[300, 500, 542, 305, 543, 307, 212, 203, 617, 413] {
+            est.note_hop_completed(2, Duration::from_millis(*msec), true);
+        }
+        assert!(est.timeouts(&b3()).0 < Duration::from_secs(1));
+
+        let params = NetParameters::from_map(
+            &"cbtmincircs=1 cbtnummodes=2 cbtmintimeout=3000"
+                .parse()
+                .unwrap(),
+        );
+        est.update_params(&params);
+        assert_eq!(est.timeouts(&b3()).0, Duration::from_secs(3));
     }
 
     #[test]
